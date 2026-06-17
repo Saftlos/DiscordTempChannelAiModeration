@@ -123,8 +123,8 @@ def check_channel_name_with_ai(original_name: str) -> tuple[bool, str, str]:
     if not GEMINI_API_KEY:
         return False, "Fehler: Google API Key fehlt in der Konfiguration.", "Configuration_Error"
 
-    # Using the Gemini 2.5 Flash model for faster response times
-    model_name = "models/gemini-2.5-flash"
+    # Using the 26B quantized attention model for faster response times
+    model_name = "models/gemma-4-26b-a4b-it"
     url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={GEMINI_API_KEY}"
 
     system_instruction = (
@@ -145,6 +145,7 @@ def check_channel_name_with_ai(original_name: str) -> tuple[bool, str, str]:
     )
 
     user_prompt = (
+        f"{system_instruction}\n\n"
         f"Bitte überprüfe den folgenden Channel-Namen:\n\n"
         f"Original-Eingabe: \"{original_name}\"\n"
         f"Normalisiert (NFKC): \"{nfkc_name}\"\n"
@@ -153,18 +154,12 @@ def check_channel_name_with_ai(original_name: str) -> tuple[bool, str, str]:
     )
 
     payload = {
-        "systemInstruction": {
-            "parts": [{"text": system_instruction}]
-        },
         "contents": [
             {
                 "role": "user",
                 "parts": [{"text": user_prompt}]
             }
-        ],
-        "generationConfig": {
-            "responseMimeType": "application/json"
-        }
+        ]
     }
 
     import time
@@ -180,7 +175,7 @@ def check_channel_name_with_ai(original_name: str) -> tuple[bool, str, str]:
                 method="POST"
             )
             
-            with urllib.request.urlopen(req, timeout=15) as response:
+            with urllib.request.urlopen(req, timeout=60) as response:
                 res_data = json.loads(response.read().decode("utf-8"))
                 
                 # Find the non-thought text part
@@ -216,7 +211,7 @@ def check_channel_name_with_ai(original_name: str) -> tuple[bool, str, str]:
                     _moderation_cache[cache_key] = {"approved": approved, "reason": reason}
                     save_cache()
 
-                    return approved, reason, "AI_Gemini_2.5_Flash"
+                    return approved, reason, "AI_Gemma_4"
                 except json.JSONDecodeError as je:
                     print(f"JSON decode error of model output: {je}. Raw output was: {text_content}")
                     raise ValueError(f"KI-Antwort konnte nicht als JSON interpretiert werden. (Raw: {text_content[:100]})")
