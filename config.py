@@ -1,3 +1,8 @@
+"""
+Configuration: secrets come from .env, server-specific IDs from config.json.
+config.json is written by the /setup command, so it never has to be edited by hand.
+"""
+
 import os
 import json
 from dotenv import load_dotenv
@@ -7,10 +12,14 @@ load_dotenv()
 
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Gemma 4 26B (MoE, ~4B active parameters): fast enough for live moderation
+GEMMA_MODEL = os.getenv("GEMMA_MODEL", "gemma-4-26b-a4b-it")
 
 CONFIG_FILE = "config.json"
 
 class Config:
+    """Discord IDs the bot needs: lobby text channel, admin log channel and the voice category."""
+
     def __init__(self):
         self.lobby_channel_id = None
         self.log_channel_id = None

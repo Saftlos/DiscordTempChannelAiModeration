@@ -5,3 +5,4 @@ bot.log
 moderation_cache.json
 test*.py
 list_models.py
+temp_channels.json

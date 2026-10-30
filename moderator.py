@@ -1,51 +1,104 @@
-import os
+"""
+Channel name moderation pipeline.
+
+A requested voice channel name passes through four stages, cheapest first,
+so the AI model is only queried when nothing local can decide:
+
+1. Whitelist  - every word is a known harmless term   -> approve instantly
+2. Blocklist  - contains a known bad term             -> deny instantly
+3. Cache      - the same name was judged before        -> reuse that verdict
+4. Gemma AI   - ask the model for a verdict + reason   -> cache the result
+
+Every stage works on Unicode-normalized text, so tricks like fullwidth letters,
+circled letters or zalgo/strikethrough marks cannot sneak past the filters.
+"""
+
 import json
-import urllib.request
+import os
+import re
+import time
 import unicodedata
-from config import GEMINI_API_KEY
+import urllib.error
+import urllib.request
+
+from config import GEMINI_API_KEY, GEMMA_MODEL
 
 WHITELIST_FILE = "whitelist.txt"
 BLOCKLIST_FILE = "blocklist.txt"
 CACHE_FILE = "moderation_cache.json"
 
-# Local cache for AI moderation results
-_moderation_cache = {}
+API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+API_TIMEOUT_SECONDS = 60
+MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 1.5
 
-def load_cache():
-    global _moderation_cache
-    if os.path.exists(CACHE_FILE):
-        try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                _moderation_cache = json.load(f)
-            print(f"Loaded {len(_moderation_cache)} cached moderation results.")
-        except Exception as e:
-            print(f"Error loading moderation cache: {e}")
-            _moderation_cache = {}
+SYSTEM_INSTRUCTION = (
+    "Du bist ein präziser, strenger und fairer Discord-Moderator für einen APEX LEGENDS Gaming-Server. "
+    "Deine Aufgabe ist es, vorgeschlagene Voice-Channel-Namen zu prüfen. "
+    "Filtere Namen heraus, die beleidigend, rassistisch, extremistisch, sexuell explizit (NSFW), "
+    "Spam oder anderweitig gegen die Discord-Nutzungsbedingungen verstoßen. "
+    "WICHTIG: Erlaube Apex-Legends-spezifische Begriffe wie 'Predator'/'Pred' (der höchste Rang im Spiel), "
+    "'Kill Leader', 'Deathbox', 'Scrims', 'Champion', 'Ranked', 'Lobby' und Legendennamen. "
+    "Diese sind im Spielkontext völlig harmlos und dürfen NICHT blockiert werden. "
+    "Beachte, dass Benutzer versuchen könnten, Filter mittels Unicode-Zeichen (z.B. Zalgo, "
+    "durchgestrichene Schrift, mathematische Symbole, Symbole im Kreis) zu umgehen. "
+    "Wir stellen dir den Originalnamen, die normalisierte Version und die von Strichen/Akzenten "
+    "bereinigte Version zur Verfügung. "
+    "Gib IMMER ausschließlich ein valides JSON-Objekt im folgenden Format zurück:\n"
+    "{\n"
+    "  \"approved\": true oder false,\n"
+    "  \"reason\": \"Erklärung auf Deutsch warum der Name freigegeben oder abgelehnt wurde\"\n"
+    "}"
+)
 
-def save_cache():
+
+# --- Cache ---------------------------------------------------------------
+
+def _load_cache() -> dict:
+    if not os.path.exists(CACHE_FILE):
+        return {}
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+        print(f"Loaded {len(cache)} cached moderation results.")
+        return cache
+    except Exception as e:
+        print(f"Error loading moderation cache: {e}")
+        return {}
+
+
+def _save_cache() -> None:
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(_moderation_cache, f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"Error saving moderation cache: {e}")
 
-# Load cache on startup
-load_cache()
+
+# Verdicts of earlier AI calls, keyed by the normalized lowercase name
+_moderation_cache: dict = _load_cache()
+
+
+# --- Normalization & word lists -----------------------------------------
 
 def normalize_text(text: str) -> tuple[str, str]:
     """
     Normalizes text to defeat Unicode exploits.
-    Returns a tuple of:
-    - (normalized_nfkc, stripped_combining)
+
+    Returns (nfkc, stripped):
+    - nfkc:     NFKC form, turns fullwidth/math/circled letters into plain ones
+    - stripped: nfkc without combining marks (strikethrough, accents, zalgo)
     """
-    # NFKC normalizes fullwidth characters, mathematical symbols, circled letters, etc.
-    nfkc = unicodedata.normalize('NFKC', text)
-    # Strip combining marks (like strikethrough, slash accents, zalgo)
+    nfkc = unicodedata.normalize("NFKC", text)
     stripped = "".join(c for c in nfkc if not unicodedata.combining(c))
     return nfkc, stripped
 
+
 def load_words_file(filepath: str) -> list[str]:
-    """Reads lines from a text file, strips spaces and filters empty lines."""
+    """
+    Reads one lowercase term per line, skipping empty lines.
+    The file is read on every call, so list edits apply without a restart.
+    """
     if not os.path.exists(filepath):
         return []
     try:
@@ -55,97 +108,40 @@ def load_words_file(filepath: str) -> list[str]:
         print(f"Error loading {filepath}: {e}")
         return []
 
+
 def check_whitelist(text: str) -> bool:
-    """
-    Checks if the text consists entirely of whitelisted terms.
-    Every word in the text must be present in the whitelist to skip AI moderation.
-    """
-    whitelist = load_words_file(WHITELIST_FILE)
+    """True if every word of the text is whitelisted (skips the AI call)."""
+    whitelist = set(load_words_file(WHITELIST_FILE))
     if not whitelist:
         return False
-    
-    nfkc, stripped = normalize_text(text)
-    
-    import re
-    # Extract all alphanumeric words (handles unicode/umlauts)
-    words = re.findall(r'\w+', stripped.lower())
-    if not words:
-        return False
-        
-    for word in words:
-        if word not in whitelist:
-            return False
-            
-    return True
+
+    _, stripped = normalize_text(text)
+    words = re.findall(r"\w+", stripped.lower())
+    return bool(words) and all(word in whitelist for word in words)
+
 
 def check_blocklist(text: str) -> bool:
-    """Checks if the text contains any blacklisted term (pre-filter to save API calls)."""
+    """
+    True if the text contains a blocklisted term anywhere.
+    Substring matching is intentional: it also catches glued spellings
+    like "xXbadwordXx" that a word-based match would miss.
+    """
     blocklist = load_words_file(BLOCKLIST_FILE)
     if not blocklist:
         return False
-    
+
     nfkc, stripped = normalize_text(text)
-    nfkc_lower = nfkc.lower()
-    stripped_lower = stripped.lower()
-    
-    for term in blocklist:
-        if term in nfkc_lower or term in stripped_lower:
-            return True
-    return False
+    candidates = (nfkc.lower(), stripped.lower())
+    return any(term in candidate for term in blocklist for candidate in candidates)
 
-def check_channel_name_with_ai(original_name: str) -> tuple[bool, str, str]:
-    """
-    Checks the channel name using Gemma 4 26B model.
-    Optimized for API conservation:
-    1. Whitelist Check (Instant Approve)
-    2. Local Blocklist Check (Instant Deny)
-    3. JSON Caching Check (Instant Lookup)
-    4. AI Call (Fallback)
-    Returns (approved: bool, reason: str, source: str).
-    """
-    nfkc_name, stripped_name = normalize_text(original_name)
-    cache_key = stripped_name.lower().strip()
 
-    # 1. Whitelist Check
-    if check_whitelist(original_name):
-        return True, "Wort aus der Whitelist erkannt (AI-Moderation übersprungen).", "Local_Whitelist"
+# --- Gemma API -----------------------------------------------------------
 
-    # 2. Local Blocklist Check (saves API requests from obvious trolls)
-    if check_blocklist(original_name):
-        return False, "Kanalname enthält blockierte Begriffe aus der lokalen Sperrliste.", "Local_Blocklist"
-
-    # 3. Cache Check (saves API requests for recurring names)
-    if cache_key in _moderation_cache:
-        cached = _moderation_cache[cache_key]
-        return cached["approved"], cached["reason"], "Local_Cache"
-
-    # 4. Gemma 4 API Request Setup
-    if not GEMINI_API_KEY:
-        return False, "Fehler: Google API Key fehlt in der Konfiguration.", "Configuration_Error"
-
-    # Using the 26B quantized attention model for faster response times
-    model_name = "models/gemma-4-26b-a4b-it"
-    url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={GEMINI_API_KEY}"
-
-    system_instruction = (
-        "Du bist ein präziser, strenger und fairer Discord-Moderator für einen APEX LEGENDS Gaming-Server. "
-        "Deine Aufgabe ist es, vorgeschlagene Voice-Channel-Namen zu prüfen. "
-        "Filtere Namen heraus, die beleidigend, rassistisch, extremistisch, sexuell explizit (NSFW), "
-        "Spam oder anderweitig gegen die Discord-Nutzungsbedingungen verstoßen. "
-        "WICHTIG: Erlaube Apex-Legends-spezifische Begriffe wie 'Predator'/'Pred' (der höchste Rang im Spiel), "
-        "'Kill Leader', 'Deathbox', 'Scrims', 'Champion', 'Ranked', 'Lobby' und Legendennamen. Diese sind im Spielkontext völlig harmlos und dürfen NICHT blockiert werden. "
-        "Beachte, dass Benutzer versuchen könnten, Filter mittels Unicode-Zeichen (z.B. Zalgo, "
-        "durchgestrichene Schrift, mathematische Symbole, Symbole im Kreis) zu umgehen. "
-        "Wir stellen dir den Originalnamen, die normalisierte Version und die von Strichen/Akzenten bereinigte Version zur Verfügung. "
-        "Gib IMMER ausschließlich ein valides JSON-Objekt im folgenden Format zurück:\n"
-        "{\n"
-        "  \"approved\": true oder false,\n"
-        "  \"reason\": \"Erklärung auf Deutsch warum der Name freigegeben oder abgelehnt wurde\"\n"
-        "}"
-    )
-
-    user_prompt = (
-        f"{system_instruction}\n\n"
+def _build_prompt(original_name: str, nfkc_name: str, stripped_name: str) -> str:
+    # Gemma has no separate system role in this API, so the instruction
+    # is placed at the top of the user message.
+    return (
+        f"{SYSTEM_INSTRUCTION}\n\n"
         f"Bitte überprüfe den folgenden Channel-Namen:\n\n"
         f"Original-Eingabe: \"{original_name}\"\n"
         f"Normalisiert (NFKC): \"{nfkc_name}\"\n"
@@ -153,81 +149,99 @@ def check_channel_name_with_ai(original_name: str) -> tuple[bool, str, str]:
         f"Antworte nur mit dem JSON-Objekt."
     )
 
-    payload = {
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": user_prompt}]
-            }
-        ]
-    }
 
-    import time
-    max_retries = 3
-    retry_delay = 1.5
+def _request_model(prompt: str) -> str:
+    """Sends one prompt to the model and returns its answer text."""
+    payload = {"contents": [{"role": "user", "parts": [{"text": prompt}]}]}
+    req = urllib.request.Request(
+        API_URL.format(model=GEMMA_MODEL),
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            # Header instead of ?key= so the key never shows up in URL logs
+            "x-goog-api-key": GEMINI_API_KEY,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=API_TIMEOUT_SECONDS) as response:
+        res_data = json.loads(response.read().decode("utf-8"))
 
-    for attempt in range(max_retries):
+    # Skip "thought" parts of thinking models, only the final answer matters
+    try:
+        for part in res_data["candidates"][0]["content"]["parts"]:
+            if not part.get("thought") and part.get("text"):
+                return part["text"]
+    except (KeyError, IndexError):
+        pass
+    raise ValueError("Ungültige Antwortstruktur der KI erhalten.")
+
+
+def _parse_verdict(text: str) -> tuple[bool, str]:
+    """Extracts (approved, reason) from the model's JSON answer, with or without ``` fences."""
+    cleaned = text.strip()
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        result = json.loads(cleaned)
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error of model output: {e}. Raw output was: {text}")
+        raise ValueError(f"KI-Antwort konnte nicht als JSON interpretiert werden. (Raw: {text[:100]})")
+
+    approved = bool(result.get("approved", False))
+    reason = str(result.get("reason", "Keine Begründung angegeben."))
+    return approved, reason
+
+
+# --- Public entry point --------------------------------------------------
+
+def check_channel_name_with_ai(original_name: str) -> tuple[bool, str, str]:
+    """
+    Runs the full moderation pipeline for a channel name.
+    Blocking (network I/O), so call it via asyncio.to_thread from the bot.
+
+    Returns (approved, reason, source) where source names the deciding stage:
+    Local_Whitelist, Local_Blocklist, Local_Cache, AI_Gemma_4,
+    Configuration_Error or API_Error. Errors always deny, never approve.
+    """
+    nfkc_name, stripped_name = normalize_text(original_name)
+    cache_key = stripped_name.lower().strip()
+
+    if check_whitelist(original_name):
+        return True, "Wort aus der Whitelist erkannt (AI-Moderation übersprungen).", "Local_Whitelist"
+
+    if check_blocklist(original_name):
+        return False, "Kanalname enthält blockierte Begriffe aus der lokalen Sperrliste.", "Local_Blocklist"
+
+    if cache_key in _moderation_cache:
+        cached = _moderation_cache[cache_key]
+        return cached["approved"], cached["reason"], "Local_Cache"
+
+    if not GEMINI_API_KEY:
+        return False, "Fehler: Google API Key fehlt in der Konfiguration.", "Configuration_Error"
+
+    prompt = _build_prompt(original_name, nfkc_name, stripped_name)
+    last_error = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST"
-            )
-            
-            with urllib.request.urlopen(req, timeout=60) as response:
-                res_data = json.loads(response.read().decode("utf-8"))
-                
-                # Find the non-thought text part
-                text_content = None
-                try:
-                    parts = res_data["candidates"][0]["content"]["parts"]
-                    for part in parts:
-                        if not part.get("thought"):
-                            text_content = part["text"]
-                            break
-                except (KeyError, IndexError):
-                    pass
-                
-                if not text_content:
-                    raise ValueError("Ungültige Antwortstruktur der KI erhalten.")
-
-                # Parse the inner JSON returned by the model
-                try:
-                    cleaned_text = text_content.strip()
-                    if cleaned_text.startswith("```json"):
-                        cleaned_text = cleaned_text[7:]
-                    if cleaned_text.startswith("```"):
-                        cleaned_text = cleaned_text[3:]
-                    if cleaned_text.endswith("```"):
-                        cleaned_text = cleaned_text[:-3]
-                    cleaned_text = cleaned_text.strip()
-                    
-                    result = json.loads(cleaned_text)
-                    approved = bool(result.get("approved", False))
-                    reason = str(result.get("reason", "Keine Begründung angegeben."))
-
-                    # Save response to cache
-                    _moderation_cache[cache_key] = {"approved": approved, "reason": reason}
-                    save_cache()
-
-                    return approved, reason, "AI_Gemma_4"
-                except json.JSONDecodeError as je:
-                    print(f"JSON decode error of model output: {je}. Raw output was: {text_content}")
-                    raise ValueError(f"KI-Antwort konnte nicht als JSON interpretiert werden. (Raw: {text_content[:100]})")
-                    
-        except (urllib.error.HTTPError, urllib.error.URLError, ValueError) as e:
-            status_code = getattr(e, 'code', None)
-            print(f"[Attempt {attempt + 1}/{max_retries}] Error querying Gemma API (Status {status_code}): {e}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay * (attempt + 1))
-                continue
-            else:
-                return False, f"Fehler bei der Kommunikation mit der Moderations-API nach {max_retries} Versuchen: {str(e)}", "API_Error"
+            approved, reason = _parse_verdict(_request_model(prompt))
+            _moderation_cache[cache_key] = {"approved": approved, "reason": reason}
+            _save_cache()
+            return approved, reason, "AI_Gemma_4"
+        except (urllib.error.URLError, TimeoutError, ValueError) as e:
+            # HTTPError is a subclass of URLError and carries the status code
+            status_code = getattr(e, "code", None)
+            print(f"[Attempt {attempt}/{MAX_RETRIES}] Error querying Gemma API (Status {status_code}): {e}")
+            last_error = e
         except Exception as e:
-            print(f"[Attempt {attempt + 1}/{max_retries}] Unexpected error querying Gemma API: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(retry_delay)
-                continue
-            else:
-                return False, f"Fehler bei der Kommunikation mit der Moderations-API: {str(e)}", "API_Error"
+            print(f"[Attempt {attempt}/{MAX_RETRIES}] Unexpected error querying Gemma API: {e}")
+            last_error = e
+
+        if attempt < MAX_RETRIES:
+            time.sleep(RETRY_DELAY_SECONDS * attempt)
+
+    return (
+        False,
+        f"Fehler bei der Kommunikation mit der Moderations-API nach {MAX_RETRIES} Versuchen: {last_error}",
+        "API_Error",
+    )
